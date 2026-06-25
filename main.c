@@ -18,6 +18,7 @@
 */
 
 #include <pspctrl.h>
+#include <pspthreadman.h>
 
 #include <string.h>
 
@@ -54,6 +55,18 @@ static float camera_override = 0;
 static unsigned char outer_deadzone = 114;
 static unsigned char inner_deadzone = 10;
 
+// --- steering feel (cubic expo curve), see compute_steering() ---
+// steering_expo: 0 = linear, 100 = full cubic. Softens response near center and
+//   sharpens toward the edges; full lock (0x2000) always lands exactly at the edge.
+// steering_edge: stick deflection (1-127) that maps to full lock. Set this to the
+//   stick's true physical max so the full travel reaches full lock, no more no less.
+// steering_inner: small center deadzone (counts) to ignore resting jitter.
+static int steering_expo = 95; // default; creator's pick for Vita. override via settings file
+static int steering_expo_default = 95; // value D-pad Up resets to (set from settings at boot)
+static unsigned char steering_edge = 127;
+static unsigned char steering_inner = 6;
+static int steering_log_x1000 = 0; // last normalized input *1000, for telemetry
+
 static int camera_controls = 0;
 static int adjacent_axes = 0;
 
@@ -67,6 +80,33 @@ static int apply_deadzone(int val){
 		val = range;
 	}
 	return val * 127 / range;
+}
+
+// Cubic "expo" steering curve. Maps raw left-stick X (0-255, center 128) to the
+// game's steering field (+-0x2000). Left (lx<128) -> positive, right -> negative,
+// matching the stock mod's sign convention. y = (1-e)x + e*x^3 with x in [0,1];
+// y(1)=1 always, so full lock stays pinned to the physical edge for any expo value.
+static int compute_steering(int lx){
+	int d, sign;
+	if(lx < 128){ d = 128 - lx; sign = 1; }
+	else if(lx > 128){ d = lx - 128; sign = -1; }
+	else { steering_log_x1000 = 0; return 0; }
+
+	if(d <= steering_inner){ steering_log_x1000 = 0; return 0; }
+	int range = (int)steering_edge - (int)steering_inner;
+	if(range < 1){ range = 1; }
+	if(d > steering_edge){ d = steering_edge; }
+
+	float x = (float)(d - steering_inner) / (float)range; // 0..1
+	float e = (float)steering_expo / 100.0f;
+	if(e < 0.0f){ e = 0.0f; }
+	if(e > 1.0f){ e = 1.0f; }
+	float y = (1.0f - e) * x + e * (x * x * x);
+
+	int s = (int)(y * 8192.0f + 0.5f);
+	if(s > 8192){ s = 8192; }
+	steering_log_x1000 = (int)(x * 1000.0f + 0.5f);
+	return sign * s;
 }
 
 static void sample_input(SceCtrlData *pad_data, int count, int negative){
@@ -89,8 +129,6 @@ static void sample_input(SceCtrlData *pad_data, int count, int negative){
 
 	// right, left, down, up
 
-	int lxp = 0;
-	int lxn = 0;
 	int lyp = 0;
 	int lyn = 0;
 	//int rxp = 0;
@@ -103,12 +141,7 @@ static void sample_input(SceCtrlData *pad_data, int count, int negative){
 		right_stick_looks_dead = 0;
 	}
 
-	if(lx < 128){
-		lxn = apply_deadzone(128 - lx);
-	}
-	if(lx > 128){
-		lxp = apply_deadzone(lx - 128);
-	}
+	// steering uses its own expo curve (compute_steering), not the linear deadzone
 	if(ly < 128){
 		lyn = apply_deadzone(128 - ly);
 	}
@@ -141,15 +174,66 @@ static void sample_input(SceCtrlData *pad_data, int count, int negative){
 	override_steering = 0;
 	override_camera = 0;
 
-	if(lxp > 0){
-		override_steering = 1;
-		steering_override = lxp * (-1);
+	// --- live expo tuning (analog-stick players), edge-detected, while driving ---
+	// D-pad Right = expo +5, Left = expo -5, Up = reset to the settings/boot value.
+	// Logged only when DEBUG_LOG=1 (the -logged build); silent otherwise.
+	{
+		u32 b = pad_data[count - 1].Buttons;
+		int inc = (b & PSP_CTRL_RIGHT) != 0;
+		int dec = (b & PSP_CTRL_LEFT) != 0;
+		int rst = (b & PSP_CTRL_UP) != 0;
+		static int prev_inc = 0;
+		static int prev_dec = 0;
+		static int prev_rst = 0;
+		if(inc && !prev_inc){
+			steering_expo += 5;
+			if(steering_expo > 100){ steering_expo = 100; }
+			LOG("expo -> %d (live +)", steering_expo);
+		}
+		if(dec && !prev_dec){
+			steering_expo -= 5;
+			if(steering_expo < 0){ steering_expo = 0; }
+			LOG("expo -> %d (live -)", steering_expo);
+		}
+		if(rst && !prev_rst){
+			steering_expo = steering_expo_default;
+			LOG("expo -> %d (reset)", steering_expo);
+		}
+		prev_inc = inc;
+		prev_dec = dec;
+		prev_rst = rst;
 	}
 
-	if(lxn > 0){
+	int steer = compute_steering(lx);
+	if(steer != 0){
 		override_steering = 1;
-		steering_override = lxn;
+		steering_override = steer; // already scaled to +-0x2000
 	}
+
+	// --- steering telemetry: per-frame, compiled out unless VERBOSE ---
+	// (this file I/O on the render-critical path was the perf/flicker culprit)
+#if VERBOSE
+	{
+		int dl = (lx < 128) ? (128 - lx) : 0;
+		int dr = (lx > 128) ? (lx - 128) : 0;
+		int dmax = (dl > dr) ? dl : dr;
+		static int steer_max_left = 0;
+		static int steer_max_right = 0;
+		int newmax = 0;
+		if(dl > steer_max_left){ steer_max_left = dl; newmax = 1; }
+		if(dr > steer_max_right){ steer_max_right = dr; newmax = 1; }
+		static u32 last_log_us = 0;
+		u32 now = sceKernelGetSystemTimeLow();
+		int active = dmax > (int)steering_inner;
+		if(newmax || (active && (u32)(now - last_log_us) >= 100000)){
+			last_log_us = now;
+			LOG("steer lx=%d d=%d x1000=%d out=%d maxL=%d maxR=%d expo=%d edge=%d in=%d",
+				lx, dmax, steering_log_x1000, steer,
+				steer_max_left, steer_max_right,
+				steering_expo, (int)steering_edge, (int)steering_inner);
+		}
+	}
+#endif
 
 	if(!right_stick_looks_dead){
 		if(ryp > 0){
@@ -308,7 +392,7 @@ void populate_car_analog_control_patched(u32 param_1, int *param_2, unsigned cha
 	if(override_steering){
 		param_3[0] = param_3[0] | 1;
 		param_3[1] = param_3[1] | 2;
-		*steering = steering_override * 0x2000 / 127;
+		*steering = steering_override; // already +-0x2000 from compute_steering
 		LOG_VERBOSE("applying steering override, val is %d, steering is %d", steering_override, *steering);
 	}else{
 		*steering = 0;
@@ -389,71 +473,61 @@ int _atoi(char *buf){
 }
 
 void parse_config(){
-    char *path = "ms0:/PSP/"MODULE_NAME"_settings.txt";
+	// Settings file: up to 3 whitespace-separated numbers, steering only:
+	//   <expo 0-100> [edge 1-127] [center deadzone 0-100]
+	// Normally only the first number (expo) is touched; the rest keep defaults.
+	char *path = "ms0:/PSP/"MODULE_NAME"_settings.txt";
 	int fd = sceIoOpen(path, PSP_O_RDONLY, 0);
 	if(fd < 0){
-		LOG("cannot open %s for reading, trying ef0:/", path);
 		path = "ef0:/PSP/"MODULE_NAME"_settings.txt";
 		fd = sceIoOpen(path, PSP_O_RDONLY, 0);
 		if(fd < 0){
-			LOG("cannot open %s for reading either", path);
+			LOG("no settings file, defaults: expo=%d edge=%d inner=%d", steering_expo, (int)steering_edge, (int)steering_inner);
 			return;
-    	}
+		}
 	}
 
 	char buf[128] = {0};
-	u32 len = sceIoRead(fd, buf, sizeof(buf));
-	if(len < 0){
-		LOG("failed reading %s after opening", path);
+	int len = sceIoRead(fd, buf, sizeof(buf) - 1);
+	sceIoClose(fd);
+	if(len <= 0){
+		LOG("settings file empty, keeping defaults");
 		return;
 	}
 
 	int arg_idx = 0;
-	char arg_buf[128] = {0};
-	u32 arg_buf_write_head = 0;
-	for(u32 i = 0;i <= len; i++){
-		if(i < len && buf[i] != ' ' && buf[i] != '\n'){
-			arg_buf[arg_buf_write_head] = buf[i];
-			arg_buf_write_head++;
-		}else{
-		    if(arg_buf_write_head == 0){
-		        continue;
-		    }
-			arg_buf[arg_buf_write_head] = '\0';
-			if(arg_idx == 0){
-				int num = _atoi(arg_buf);
-				camera_controls = num && is_emulator;
-				if(camera_controls){
-				    LOG("enabling camera controls");
-				}else{
-				    LOG("not enabling camera controls");
-				}
-			}else if(arg_idx == 1){
-				int num = _atoi(arg_buf);
-				if(num > 127){
-					num = 127;
-				}
-				if(num < 0){
-					num = 0;
-				}
-				LOG("overriding inner deadzone %d with %d", inner_deadzone, num);
-				inner_deadzone = num;
-			}else if(arg_idx == 2){
-				int num = _atoi(arg_buf);
-				if(num > 127){
-					num = 127;
-				}
-				if(num < 0){
-					num = 0;
-				}
-				LOG("overriding outer deadzone %d with %d", outer_deadzone, num);
-				outer_deadzone = num;
+	char arg_buf[64] = {0};
+	int w = 0;
+	for(int i = 0; i <= len; i++){
+		char c = (i < len) ? buf[i] : ' ';
+		if(c != ' ' && c != '\n' && c != '\r' && c != '\t' && c != '\0'){
+			if(w < (int)sizeof(arg_buf) - 1){
+				arg_buf[w++] = c;
 			}
-
-			arg_buf_write_head = 0;
+		}else{
+			if(w == 0){
+				continue;
+			}
+			arg_buf[w] = '\0';
+			int num = _atoi(arg_buf);
+			if(arg_idx == 0){
+				if(num < 0){ num = 0; }
+				if(num > 100){ num = 100; }
+				steering_expo = num;
+			}else if(arg_idx == 1){
+				if(num < 1){ num = 1; }
+				if(num > 127){ num = 127; }
+				steering_edge = (unsigned char)num;
+			}else if(arg_idx == 2){
+				if(num < 0){ num = 0; }
+				if(num > 100){ num = 100; }
+				steering_inner = (unsigned char)num;
+			}
+			w = 0;
 			arg_idx++;
 		}
 	}
+	LOG("settings loaded: expo=%d edge=%d inner=%d", steering_expo, (int)steering_edge, (int)steering_inner);
 }
 
 int init(){
@@ -479,6 +553,7 @@ int init(){
 		inner_deadzone = 3;
 	}
 	parse_config();
+	steering_expo_default = steering_expo; // D-pad Up resets to the boot/settings value
 
 	//HIJACK_FUNCTION(offset_digital_to_analog, digital_to_analog_patched, digital_to_analog_orig);
 	//HIJACK_FUNCTION(offset_populate_car_digital_control, populate_car_digital_control_patched, populate_car_digital_control_orig);
