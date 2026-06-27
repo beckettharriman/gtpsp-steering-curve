@@ -3,7 +3,9 @@ OBJS = main.o hooking.o disc_ident.o exports.o
 
 # DEBUG_LOG=0 -> silent build; DEBUG_LOG=1 -> logged build (boot diagnostics + live-tune changes)
 DEBUG_LOG ?= 1
-CFLAGS = $(CFLAGS_EXTRA) -O2 -Os -G0 -Wall -fshort-wchar -fno-pic -mno-check-zero-division -fno-builtin -DDEBUG_LOG=$(DEBUG_LOG)
+# LIVE_TUNE=1 -> include the in-game D-pad expo tuner; LIVE_TUNE=0 -> omit it (settings-file only)
+LIVE_TUNE ?= 1
+CFLAGS = $(CFLAGS_EXTRA) -O2 -Os -G0 -Wall -fshort-wchar -fno-pic -mno-check-zero-division -fno-builtin -DDEBUG_LOG=$(DEBUG_LOG) -DLIVE_TUNE=$(LIVE_TUNE)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 

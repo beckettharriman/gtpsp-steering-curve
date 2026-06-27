@@ -176,7 +176,8 @@ static void sample_input(SceCtrlData *pad_data, int count, int negative){
 
 	// --- live expo tuning (analog-stick players), edge-detected, while driving ---
 	// D-pad Right = expo +5, Left = expo -5, Up = reset to the settings/boot value.
-	// Logged only when DEBUG_LOG=1 (the -logged build); silent otherwise.
+	// Compiled in only when LIVE_TUNE=1 (the -adjustable build); omitted otherwise.
+#if LIVE_TUNE
 	{
 		u32 b = pad_data[count - 1].Buttons;
 		int inc = (b & PSP_CTRL_RIGHT) != 0;
@@ -203,6 +204,7 @@ static void sample_input(SceCtrlData *pad_data, int count, int negative){
 		prev_dec = dec;
 		prev_rst = rst;
 	}
+#endif // LIVE_TUNE
 
 	int steer = compute_steering(lx);
 	if(steer != 0){
